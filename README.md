@@ -26,7 +26,7 @@ On my NTUC Starter Awards project, our team surveyed young workers and sorted th
    ```
    streamlit run app.py
    ```
-6. Your browser opens the app. Click **Try sample data**, then **Analyse with AI**.
+6. Your browser opens the app. Upload a survey CSV, then click **Analyse with AI**.
 
 ## Put it online for free
 
@@ -42,6 +42,5 @@ On my NTUC Starter Awards project, our team surveyed young workers and sorted th
 
 ## Notes
 
-- `sample_survey.csv` is made-up data for testing. It is not the real NTUC survey.
 - Up to 300 answers per question are sent to Gemini, which keeps it within the free tier.
 - If you see a "model not found" error, change the model name in the sidebar (for example to `gemini-2.5-flash`).

@@ -6,20 +6,107 @@ and a short summary with recommendations.
 Built by Wong Jun Yi with Streamlit, pandas and Google Gemini.
 """
 
+import html
 import json
 import os
-from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
-APP_DIR = Path(__file__).parent
-SAMPLE_FILE = APP_DIR / "sample_survey.csv"
 MAX_RESPONSES = 300          # cap sent to the AI per question, keeps it fast and free-tier friendly
+MAX_RUNS_PER_SESSION = 5     # stops one visitor from using up the free Gemini quota on the live demo
 DEFAULT_MODEL = "gemini-flash-latest"
 FALLBACK_MODEL = "gemini-2.5-flash"
 
-st.set_page_config(page_title="Survey Insight Assistant", page_icon="📊", layout="wide")
+INK = "#0F1B3D"
+SOFT = "#56618A"
+LINE = "#D6DDF0"
+ACCENT = "#2D5BFF"
+ACCENT_SOFT = "#EAF0FF"
+
+st.set_page_config(page_title="Survey Insight Assistant", page_icon="📊", layout="wide",
+                   initial_sidebar_state="collapsed")
+
+
+# ---------- look and feel ----------
+
+def inject_css():
+    st.markdown(f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@600;700;800&family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600&display=swap');
+.stApp {{ font-family: "DM Sans", system-ui, sans-serif; }}
+.stApp button, .stApp input, .stApp textarea, .stApp p, .stApp label, .stApp li {{ font-family: inherit; }}
+[data-testid="stIconMaterial"], .material-symbols-rounded {{ font-family: "Material Symbols Rounded" !important; }}
+h1, h2, h3, h4, .si-display {{ font-family: "Sora", system-ui, sans-serif !important; letter-spacing: -.02em; color: {INK}; }}
+.block-container {{ max-width: 1100px; padding-top: 2.2rem; padding-bottom: 4rem; }}
+[data-testid="stHeader"] {{ background: transparent; }}
+.stApp {{ background: #F7F9FD; }}
+[data-testid="stVerticalBlockBorderWrapper"] {{ background:#fff; }}
+
+/* hero */
+.si-hero {{ padding: 8px 0 18px; }}
+.si-chip {{ display:inline-flex; align-items:center; gap:8px; padding:6px 12px; border-radius:999px; background:{ACCENT_SOFT}; border:1px solid #BFD0FF; font-weight:600; font-size:.9rem; color:{INK}; }}
+.si-hero h1 {{ font-size: clamp(2.2rem, 5vw, 3.4rem); font-weight: 800; line-height: 1.05; margin: 14px 0 10px; padding: 0; }}
+.si-hero p {{ font-size: 1.15rem; color: {SOFT}; max-width: 60ch; margin: 0; }}
+.si-steps {{ display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:12px; margin-top:24px; }}
+.si-step {{ border:1.5px solid {LINE}; border-radius:16px; padding:14px 16px; background:#fff; }}
+.si-step b {{ display:block; font-family:"Sora",sans-serif; font-size:1rem; color:{INK}; }}
+.si-step span {{ color:{SOFT}; font-size:.92rem; }}
+.si-step i {{ font-style:normal; display:inline-flex; width:26px; height:26px; border-radius:50%; background:{ACCENT}; color:#fff; align-items:center; justify-content:center; font-size:.85rem; font-weight:700; margin-bottom:8px; }}
+
+/* section headings */
+.si-h {{ font-family:"Sora",sans-serif; font-weight:800; font-size:1.6rem; color:{INK}; margin:34px 0 4px; }}
+.si-sub {{ color:{SOFT}; margin:0 0 14px; }}
+
+/* metric cards */
+.si-metrics {{ display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:12px; margin:8px 0 6px; }}
+.si-metric {{ border:1.5px solid {LINE}; border-radius:16px; padding:16px 18px; background:#fff; }}
+.si-metric .n {{ font-family:"Sora",sans-serif; font-weight:800; font-size:2rem; color:{INK}; line-height:1.1; }}
+.si-metric .l {{ color:{SOFT}; font-size:.95rem; }}
+
+/* bordered containers, uploader, buttons */
+[data-testid="stVerticalBlockBorderWrapper"] {{ border-radius:18px !important; border:1.5px solid {LINE} !important; }}
+[data-testid="stFileUploaderDropzone"] {{ border-radius:14px; border:2px dashed {LINE}; background:#F7F9FD; }}
+.stButton > button, .stDownloadButton > button {{ border-radius:999px; border:1.5px solid {INK}; font-weight:600; padding:.5rem 1.2rem; color:{INK}; background:#fff; }}
+.stButton > button:hover, .stDownloadButton > button:hover {{ background:{ACCENT_SOFT}; color:{INK}; border-color:{ACCENT}; }}
+.stButton > button[kind="primary"] {{ background:{ACCENT}; border-color:{ACCENT}; color:#fff; }}
+.stButton > button[kind="primary"]:hover {{ background:#1E46E0; border-color:#1E46E0; color:#fff; }}
+.stMultiSelect [data-baseweb="tag"] {{ background:{ACCENT_SOFT}; border:1px solid #BFD0FF; color:{INK}; }}
+.stMultiSelect [data-baseweb="tag"] span {{ color:{INK}; }}
+
+/* empty state */
+.si-empty {{ text-align:center; padding:28px 16px; color:{SOFT}; }}
+.si-empty b {{ color:{INK}; font-family:"Sora",sans-serif; font-size:1.1rem; display:block; margin-bottom:4px; }}
+
+/* results */
+.si-q {{ font-family:"Sora",sans-serif; font-weight:800; font-size:1.35rem; color:{INK}; margin:28px 0 10px; }}
+.si-summary {{ background:{ACCENT_SOFT}; border:1.5px solid #BFD0FF; border-radius:16px; padding:16px 18px; color:{INK}; font-size:1.05rem; margin-bottom:14px; }}
+.si-summary small {{ display:block; font-weight:600; color:{SOFT}; margin-bottom:4px; font-size:.85rem; }}
+.si-themes {{ display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:12px; }}
+.si-theme {{ border:1.5px solid {LINE}; border-radius:16px; padding:16px 18px; background:#fff; }}
+.si-theme-top {{ display:flex; justify-content:space-between; align-items:baseline; gap:12px; }}
+.si-theme h4 {{ margin:0; padding:0; font-size:1.08rem; font-weight:700; }}
+.si-count {{ flex:none; font-weight:700; color:{INK}; font-size:.92rem; }}
+.si-bar {{ height:8px; border-radius:99px; background:#E6EBF7; margin:10px 0 10px; overflow:hidden; }}
+.si-bar span {{ display:block; height:100%; background:{ACCENT}; border-radius:99px; }}
+.si-theme p {{ margin:0 0 8px; color:{SOFT}; font-size:.95rem; }}
+.si-quote {{ border-left:3px solid {ACCENT}; padding:4px 0 4px 12px; margin:8px 0 0; color:{INK}; font-size:.95rem; font-style:italic; }}
+.si-recs {{ display:grid; gap:10px; margin-top:14px; }}
+.si-rec {{ display:flex; gap:12px; align-items:flex-start; border:1.5px solid {LINE}; border-radius:14px; padding:12px 14px; background:#fff; color:{INK}; }}
+.si-rec i {{ font-style:normal; flex:none; width:24px; height:24px; border-radius:50%; background:{ACCENT}; color:#fff; display:inline-flex; align-items:center; justify-content:center; font-size:.8rem; }}
+.si-foot {{ margin-top:48px; padding-top:18px; border-top:1.5px solid {LINE}; color:{SOFT}; font-size:.9rem; }}
+.si-foot a {{ color:{INK}; font-weight:600; }}
+
+@media (max-width: 760px) {{
+  .si-steps, .si-metrics, .si-themes {{ grid-template-columns: 1fr; }}
+}}
+</style>
+""", unsafe_allow_html=True)
+
+
+def esc(x) -> str:
+    return html.escape(str(x if x is not None else ""))
 
 
 # ---------- helpers ----------
@@ -49,6 +136,32 @@ def classify_columns(df: pd.DataFrame):
         else:
             choice.append(col)
     return choice, rating, text
+
+
+def bar_chart(df: pd.DataFrame, col: str, is_rating: bool):
+    counts = df[col].value_counts()
+    if is_rating:
+        counts = counts.sort_index()
+    data = pd.DataFrame({"answer": counts.index.astype(str), "pct": (counts / counts.sum() * 100).round(0).values})
+    order = list(data["answer"])
+    base = alt.Chart(data)
+    if is_rating:
+        bars = base.mark_bar(color=ACCENT, cornerRadiusTopLeft=6, cornerRadiusTopRight=6).encode(
+            x=alt.X("answer:N", sort=order, title=None, axis=alt.Axis(labelAngle=0)),
+            y=alt.Y("pct:Q", title=None, axis=None))
+        labels = base.mark_text(dy=-8, color=INK, fontWeight=600).encode(
+            x=alt.X("answer:N", sort=order), y="pct:Q", text=alt.Text("pct:Q", format=".0f"))
+        h = 200
+    else:
+        bars = base.mark_bar(color=ACCENT, cornerRadiusTopRight=6, cornerRadiusBottomRight=6, height=22).encode(
+            y=alt.Y("answer:N", sort=order, title=None, axis=alt.Axis(labelLimit=220)),
+            x=alt.X("pct:Q", title=None, axis=None, scale=alt.Scale(domain=[0, max(100, data.pct.max())])))
+        labels = base.mark_text(align="left", dx=6, color=INK, fontWeight=600).encode(
+            y=alt.Y("answer:N", sort=order), x="pct:Q", text=alt.Text("pct:Q", format=".0f"))
+        h = max(90, 34 * len(data))
+    chart = (bars + labels).properties(height=h).configure_view(strokeWidth=0) \
+        .configure_axis(labelColor=SOFT, labelFontSize=13, grid=False, domain=False, ticks=False)
+    return chart
 
 
 def analyse_text(responses: list[str], question: str, api_key: str, model: str) -> dict:
@@ -96,112 +209,149 @@ def build_report(df, choice_cols, rating_cols, ai_results) -> str:
     for col, res in ai_results.items():
         lines += [f"## {col}", "", res.get("summary", ""), "", "### Themes"]
         for t in res.get("themes", []):
-            lines.append(f"- **{t['name']}** ({t.get('count', 0)}): {t.get('description', '')}")
+            lines.append(f"- **{t.get('name', '')}** ({t.get('count', 0)}): {t.get('description', '')}")
             lines += [f'  - "{q}"' for q in t.get("quotes", [])]
         lines += ["", "### Recommendations"] + [f"- {r}" for r in res.get("recommendations", [])] + [""]
     return "\n".join(lines)
 
 
-# ---------- sidebar ----------
+def render_results(col: str, res: dict, n_answers: int):
+    st.markdown(f'<div class="si-q">{esc(col)}</div>', unsafe_allow_html=True)
+    if res.get("summary"):
+        st.markdown(f'<div class="si-summary"><small>Summary</small>{esc(res["summary"])}</div>',
+                    unsafe_allow_html=True)
+    themes = sorted(res.get("themes", []), key=lambda t: -int(t.get("count", 0) or 0))
+    total = max(sum(int(t.get("count", 0) or 0) for t in themes), n_answers, 1)
+    cards = []
+    for t in themes:
+        c = int(t.get("count", 0) or 0)
+        pct = round(c / total * 100)
+        quotes = "".join(f'<div class="si-quote">"{esc(q)}"</div>' for q in t.get("quotes", [])[:2])
+        cards.append(f'''<div class="si-theme"><div class="si-theme-top"><h4>{esc(t.get("name", ""))}</h4>
+<span class="si-count">{c} answers · {pct}%</span></div>
+<div class="si-bar"><span style="width:{pct}%"></span></div>
+<p>{esc(t.get("description", ""))}</p>{quotes}</div>''')
+    if cards:
+        st.markdown(f'<div class="si-themes">{"".join(cards)}</div>', unsafe_allow_html=True)
+    recs = res.get("recommendations", [])
+    if recs:
+        items = "".join(f'<div class="si-rec"><i>✓</i><span>{esc(r)}</span></div>' for r in recs)
+        st.markdown(f'<div class="si-h" style="font-size:1.1rem;margin-top:22px">Recommendations</div>'
+                    f'<div class="si-recs">{items}</div>', unsafe_allow_html=True)
+
+
+# ---------- page ----------
+
+inject_css()
 
 with st.sidebar:
-    st.header("Settings")
+    st.markdown("### Settings")
     api_key = get_api_key()
     if not api_key:
         api_key = st.text_input("Gemini API key", type="password",
                                 help="Free from aistudio.google.com. It is only used for this session.")
     else:
-        st.success("Gemini API key loaded")
+        st.success("AI is ready to use")
     model = st.text_input("Model", value=DEFAULT_MODEL)
+    runs_left = MAX_RUNS_PER_SESSION - st.session_state.get("runs", 0)
+    st.caption(f"AI analyses left this visit: {max(runs_left, 0)} of {MAX_RUNS_PER_SESSION}")
     st.caption("Your data is sent to Google Gemini only when you click Analyse.")
 
-# ---------- main ----------
+st.markdown("""
+<div class="si-hero">
+  <span class="si-chip">✨ AI-powered survey analysis</span>
+  <h1>Survey Insight Assistant</h1>
+  <p>Turn hundreds of survey answers into clear themes, real quotes and recommendations in under a minute.</p>
+  <div class="si-steps">
+    <div class="si-step"><i>1</i><b>Upload your survey</b><span>Any CSV, like a Google Forms export</span></div>
+    <div class="si-step"><i>2</i><b>See the numbers</b><span>Instant charts for every multiple-choice question</span></div>
+    <div class="si-step"><i>3</i><b>Get AI insights</b><span>Themes, quotes and recommendations from written answers</span></div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-st.title("📊 Survey Insight Assistant")
-st.write("Upload survey results to get instant charts, AI-grouped themes from open-ended answers, "
-         "and a short summary you can drop into a report.")
+with st.container(border=True):
+    uploaded = st.file_uploader("Upload a CSV file", type="csv", label_visibility="collapsed")
 
-c1, c2 = st.columns([3, 1])
-uploaded = c1.file_uploader("Upload a CSV file", type="csv")
-use_sample = c2.button("Try sample data", use_container_width=True)
+if uploaded is not None and st.session_state.get("file_name") != uploaded.name:
+    st.session_state["file_name"] = uploaded.name
+    st.session_state.pop("ai_results", None)
 
-if use_sample:
-    st.session_state["use_sample"] = True
-if uploaded is not None:
-    st.session_state["use_sample"] = False
-
-if uploaded is not None:
-    df = pd.read_csv(uploaded)
-elif st.session_state.get("use_sample") and SAMPLE_FILE.exists():
-    df = pd.read_csv(SAMPLE_FILE)
-    st.info("Using sample data: a made-up survey of young workers about their first jobs.")
-else:
+if uploaded is None:
+    st.markdown('<div class="si-empty"><b>Upload a survey to get started</b>'
+                'Export your responses as a CSV file, for example from Google Forms or Microsoft Forms.</div>',
+                unsafe_allow_html=True)
     st.stop()
+
+try:
+    df = pd.read_csv(uploaded)
+except Exception:
+    st.error("This file couldn't be read as a CSV. Export your survey as CSV and upload it again.")
+    st.stop()
+source = esc(uploaded.name)
 
 choice_cols, rating_cols, text_cols = classify_columns(df)
 
-m1, m2, m3 = st.columns(3)
-m1.metric("Responses", len(df))
-m2.metric("Questions", len(df.columns))
-m3.metric("Open-ended questions", len(text_cols))
+st.markdown(f'<div class="si-h">Overview</div><p class="si-sub">{source}</p>', unsafe_allow_html=True)
+st.markdown(f"""<div class="si-metrics">
+<div class="si-metric"><div class="n">{len(df)}</div><div class="l">Responses</div></div>
+<div class="si-metric"><div class="n">{len(df.columns)}</div><div class="l">Questions</div></div>
+<div class="si-metric"><div class="n">{len(text_cols)}</div><div class="l">Open-ended questions for AI</div></div>
+</div>""", unsafe_allow_html=True)
+with st.expander("Preview the data"):
+    st.dataframe(df, width="stretch", hide_index=True)
 
-with st.expander("Preview data"):
-    st.dataframe(df, use_container_width=True)
-
-# Quick charts
 if choice_cols or rating_cols:
-    st.subheader("Quick charts")
-    cols = st.columns(2)
+    st.markdown('<div class="si-h">The numbers</div><p class="si-sub">Percentage of responses for each answer.</p>',
+                unsafe_allow_html=True)
+    grid = st.columns(2, gap="medium")
     for i, col in enumerate(choice_cols + rating_cols):
-        with cols[i % 2]:
-            st.markdown(f"**{col}**")
-            if col in rating_cols:
-                st.caption(f"Average: {df[col].mean():.1f}")
-                counts = df[col].value_counts().sort_index()
-            else:
-                counts = df[col].value_counts()
-            st.bar_chart((counts / counts.sum() * 100).round(0).rename("% of responses"), horizontal=col not in rating_cols)
+        with grid[i % 2]:
+            with st.container(border=True):
+                st.markdown(f"**{esc(col)}**")
+                if col in rating_cols:
+                    st.caption(f"Average score: {df[col].mean():.1f}")
+                st.altair_chart(bar_chart(df, col, col in rating_cols), width="stretch")
 
-# AI themes
-st.subheader("AI themes from open-ended answers")
+st.markdown('<div class="si-h">AI insights</div><p class="si-sub">Let AI read the written answers and find the '
+            'patterns for you.</p>', unsafe_allow_html=True)
 if not text_cols:
-    st.write("No open-ended questions found in this file.")
+    st.info("This file has no open-ended questions to analyse.")
     st.stop()
 
-picked = st.multiselect("Questions to analyse", text_cols, default=text_cols)
-if st.button("Analyse with AI", type="primary", disabled=not picked):
+with st.container(border=True):
+    picked = st.multiselect("Questions to analyse", text_cols, default=text_cols)
+    go = st.button("✨ Analyse with AI", type="primary", disabled=not picked)
+
+if go:
     if not api_key:
-        st.error("Add your Gemini API key in the sidebar first.")
+        st.error("Add a Gemini API key in the sidebar first.")
         st.stop()
+    runs = st.session_state.get("runs", 0)
+    if runs >= MAX_RUNS_PER_SESSION:
+        st.warning(f"You've used all {MAX_RUNS_PER_SESSION} AI analyses for this demo. "
+                   "Refresh the page later to try again.")
+        st.stop()
+    st.session_state["runs"] = runs + 1
     results = {}
     for col in picked:
         answers = df[col].dropna().astype(str).str.strip()
         answers = answers[answers != ""].tolist()[:MAX_RESPONSES]
         with st.spinner(f"Reading {len(answers)} answers to \"{col}\"..."):
             try:
-                results[col] = analyse_text(answers, col, api_key, model)
+                results[col] = (analyse_text(answers, col, api_key, model), len(answers))
             except Exception as e:
-                st.error(f"Couldn't analyse \"{col}\": {e}. Check your API key and model name, then try again.")
+                st.error(f"Couldn't analyse \"{col}\". Check the API key and model name, then try again. ({e})")
     st.session_state["ai_results"] = results
 
 results = st.session_state.get("ai_results", {})
-for col, res in results.items():
-    st.markdown(f"### {col}")
-    st.write(res.get("summary", ""))
-    themes = res.get("themes", [])
-    if themes:
-        chart = pd.Series({t["name"]: t.get("count", 0) for t in themes}, name="Answers").sort_values()
-        st.bar_chart(chart, horizontal=True)
-        for t in themes:
-            with st.expander(f"{t['name']} ({t.get('count', 0)})"):
-                st.write(t.get("description", ""))
-                for q in t.get("quotes", []):
-                    st.markdown(f"> {q}")
-    if res.get("recommendations"):
-        st.markdown("**Recommendations**")
-        for r in res["recommendations"]:
-            st.markdown(f"- {r}")
+for col, (res, n) in results.items():
+    render_results(col, res, n)
 
 if results:
-    report = build_report(df, choice_cols, rating_cols, results)
-    st.download_button("Download report (Markdown)", report, file_name="survey_insights.md")
+    report = build_report(df, choice_cols, rating_cols, {k: v[0] for k, v in results.items()})
+    st.write("")
+    st.download_button("Download full report", report, file_name="survey_insights.md")
+
+st.markdown('<div class="si-foot">Built by <a href="https://wong-jun-yi.netlify.app" target="_blank">Wong Jun Yi</a> '
+            'with Python, Streamlit and Google Gemini.</div>', unsafe_allow_html=True)
