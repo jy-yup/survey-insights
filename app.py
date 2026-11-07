@@ -7,17 +7,25 @@ Built by Wong Jun Yi with Streamlit, pandas and Google Gemini.
 """
 
 import html
+import io
 import json
 import os
+import re
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+from streamlit import config as _st_config
+
+# Lock the light theme so the app stays readable even when a visitor's device is in dark mode
+for _k, _v in {"theme.base": "light", "theme.primaryColor": "#2D5BFF", "theme.backgroundColor": "#F7F9FD",
+               "theme.secondaryBackgroundColor": "#EAF0FF", "theme.textColor": "#0F1B3D"}.items():
+    _st_config.set_option(_k, _v)
 
 MAX_RESPONSES = 300          # cap sent to the AI per question, keeps it fast and free-tier friendly
 MAX_RUNS_PER_SESSION = 5     # stops one visitor from using up the free Gemini quota on the live demo
-DEFAULT_MODEL = "gemini-flash-latest"
-FALLBACK_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
+FALLBACK_MODELS = ["gemini-flash-latest", "gemini-3.8-flash"]
 
 INK = "#0F1B3D"
 SOFT = "#56618A"
@@ -98,6 +106,35 @@ h1, h2, h3, h4, .si-display {{ font-family: "Sora", system-ui, sans-serif !impor
 .si-foot {{ margin-top:48px; padding-top:18px; border-top:1.5px solid {LINE}; color:{SOFT}; font-size:.9rem; }}
 .si-foot a {{ color:{INK}; font-weight:600; }}
 
+/* readable in any browser theme: force light colours everywhere */
+:root, .stApp {{ color-scheme: light; }}
+.stApp {{ color:{INK}; }}
+.stApp h1, .stApp h2, .stApp h3, .stApp h4, .si-hero h1, .si-h, .si-q, .si-theme h4 {{ color:{INK} !important; }}
+.si-hero p, .si-sub, .si-step span, .si-metric .l, .si-theme p, .si-empty {{ color:{SOFT} !important; }}
+.stMarkdown p, .stMarkdown li, .stMarkdown strong, [data-testid="stWidgetLabel"] p, [data-testid="stWidgetLabel"] label {{ color:{INK}; }}
+[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] * {{ color:{SOFT} !important; }}
+[data-testid="stFileUploaderDropzone"] {{ background:#fff !important; }}
+[data-testid="stFileUploaderDropzone"] * {{ color:{SOFT} !important; }}
+[data-testid="stFileUploaderDropzone"] button {{ background:#fff !important; color:{INK} !important; border:1.5px solid {LINE} !important; border-radius:999px !important; }}
+[data-testid="stFileUploaderDropzone"] button * {{ color:{INK} !important; }}
+[data-testid="stFileUploaderFile"], [data-testid="stFileUploaderFile"] * {{ color:{INK} !important; }}
+[data-testid="stExpander"] details {{ background:#fff; border-color:{LINE}; }}
+[data-testid="stExpander"] summary, [data-testid="stExpander"] summary * {{ color:{INK} !important; }}
+[data-testid="stVerticalBlockBorderWrapper"] {{ background:#fff !important; }}
+[data-baseweb="select"] > div, [data-baseweb="input"], [data-baseweb="base-input"], .stApp input, .stApp textarea {{ background:#fff !important; color:{INK} !important; }}
+[data-baseweb="popover"] li, [data-baseweb="menu"] li {{ color:{INK}; }}
+[data-testid="stSidebar"] {{ background:#EEF2FB; }}
+[data-testid="stSidebar"] * {{ color:{INK}; }}
+.stButton > button[kind="primary"], .stButton > button[kind="primary"] * {{ color:#fff !important; }}
+.stButton > button:not([kind="primary"]), .stDownloadButton > button {{ background:#fff !important; color:{INK} !important; }}
+.stButton > button:not([kind="primary"]) *, .stDownloadButton > button * {{ color:{INK} !important; }}
+.si-step i, .si-rec i {{ color:#fff !important; }}
+[data-testid="stAlertContainer"] {{ background:#fff !important; border:1.5px solid {LINE} !important; border-radius:14px !important; }}
+[data-testid="stAlertContainer"] * {{ color:{INK} !important; }}
+[data-testid="stAlertContentError"] {{ border-left:4px solid #D93025; padding-left:12px; }}
+.stMultiSelect [data-baseweb="tag"] {{ background:{ACCENT_SOFT} !important; border:1px solid #BFD0FF !important; }}
+.stMultiSelect [data-baseweb="tag"] * {{ color:{INK} !important; }}
+
 @media (max-width: 760px) {{
   .si-steps, .si-metrics, .si-themes {{ grid-template-columns: 1fr; }}
 }}
@@ -120,21 +157,74 @@ def get_api_key() -> str:
     return key or os.environ.get("GEMINI_API_KEY", "")
 
 
-def classify_columns(df: pd.DataFrame):
-    """Split columns into multiple-choice, rating (numbers) and open-ended text."""
-    choice, rating, text = [], [], []
-    for col in df.columns:
-        s = df[col].dropna()
-        if s.empty:
+TYPE_CHOICE, TYPE_RATING, TYPE_TEXT, TYPE_SKIP = "Multiple choice", "Rating (number)", "Written answer", "Skip"
+TYPES = [TYPE_CHOICE, TYPE_RATING, TYPE_TEXT, TYPE_SKIP]
+SKIP_NAME = re.compile(r"(time ?stamp|^date|date submitted|submitted at|start time|completion time|end time|"
+                       r"e-?mail|full name|^name$|your name|^id$|respondent|response id|user ?id|phone|"
+                       r"mobile|contact|ip address|^#$)", re.I)
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def read_survey(uploaded) -> pd.DataFrame:
+    """Read a CSV (any common encoding or separator) or an Excel file."""
+    name = uploaded.name.lower()
+    data = uploaded.getvalue()
+    if name.endswith((".xlsx", ".xlsm")):
+        return pd.read_excel(io.BytesIO(data), engine="openpyxl")
+    last_error = None
+    for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
+        try:
+            text = data.decode(enc)
+        except UnicodeDecodeError as e:
+            last_error = e
             continue
-        if pd.api.types.is_numeric_dtype(s):
-            (rating if s.nunique() <= 11 else choice).append(col)
+        try:
+            df = pd.read_csv(io.StringIO(text), sep=None, engine="python")
+        except Exception as e:
+            last_error = e
             continue
-        avg_len = s.astype(str).str.len().mean()
-        if avg_len > 30 or s.nunique() > max(12, len(s) * 0.5):
-            text.append(col)
-        else:
-            choice.append(col)
+        # Some exports wrap each whole row in quotes, so everything lands in one column
+        if df.shape[1] == 1 and any(d in str(df.columns[0]) for d in (",", ";", "\t")):
+            lines = [ln.strip().strip('"') for ln in text.splitlines() if ln.strip()]
+            df = pd.read_csv(io.StringIO("\n".join(lines)), sep=None, engine="python")
+        return df
+    raise ValueError(last_error)
+
+
+def looks_like_skip(col: str, s: pd.Series) -> bool:
+    """Timestamps, emails, names and IDs aren't survey questions."""
+    if SKIP_NAME.search(str(col).strip()):
+        return True
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return True
+    sample = s.astype(str).head(50)
+    if sample.str.match(EMAIL_RE).mean() > 0.6:
+        return True
+    if not pd.api.types.is_numeric_dtype(s):
+        parsed = pd.to_datetime(sample, errors="coerce", format="mixed")
+        if parsed.notna().mean() > 0.8 and sample.str.contains(r"\d", regex=True).mean() > 0.8:
+            return True
+    if pd.api.types.is_numeric_dtype(s) and s.nunique() == len(s) and len(s) > 20:
+        return True   # a unique number per row is an ID
+    return False
+
+
+def guess_type(col: str, df: pd.DataFrame) -> str:
+    s = df[col].dropna()
+    if s.empty or looks_like_skip(col, s):
+        return TYPE_SKIP
+    if pd.api.types.is_numeric_dtype(s):
+        return TYPE_RATING if s.nunique() <= 11 else TYPE_CHOICE
+    avg_len = s.astype(str).str.len().mean()
+    if avg_len > 30 or s.nunique() > max(12, len(s) * 0.5):
+        return TYPE_TEXT
+    return TYPE_CHOICE
+
+
+def split_types(types: dict):
+    choice = [c for c, t in types.items() if t == TYPE_CHOICE]
+    rating = [c for c, t in types.items() if t == TYPE_RATING]
+    text = [c for c, t in types.items() if t == TYPE_TEXT]
     return choice, rating, text
 
 
@@ -164,6 +254,20 @@ def bar_chart(df: pd.DataFrame, col: str, is_rating: bool):
     return chart
 
 
+def pick_flash_model(client):
+    """Find the newest available Flash model on this API key."""
+    try:
+        names = [m.name.split("/")[-1] for m in client.models.list()
+                 if "flash" in m.name and "generateContent" in (getattr(m, "supported_actions", None) or ["generateContent"])
+                 and not any(x in m.name for x in ("lite", "image", "tts", "audio", "live", "embedding", "preview", "exp"))]
+    except Exception:
+        return None
+    def version(n):
+        nums = re.findall(r"\d+(?:\.\d+)?", n)
+        return float(nums[0]) if nums else 0.0
+    return max(names, key=version) if names else None
+
+
 def analyse_text(responses: list[str], question: str, api_key: str, model: str) -> dict:
     """Ask Gemini to group answers into themes. Returns a dict (see prompt for shape)."""
     from google import genai
@@ -186,15 +290,47 @@ Answers:
 {numbered}"""
 
     config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0.2)
-    try:
-        resp = client.models.generate_content(model=model, contents=prompt, config=config)
-    except Exception as e:
-        # If the chosen model name isn't available, try a known one once.
-        if model != FALLBACK_MODEL and ("not found" in str(e).lower() or "404" in str(e)):
-            resp = client.models.generate_content(model=FALLBACK_MODEL, contents=prompt, config=config)
-        else:
-            raise
+
+    def call(m):
+        return client.models.generate_content(model=m, contents=prompt, config=config)
+
+    tried = []
+    candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
+    while candidates:
+        m = candidates.pop(0)
+        if m in tried:
+            continue
+        tried.append(m)
+        try:
+            resp = call(m)
+            st.session_state["working_model"] = m
+            break
+        except Exception as e:
+            msg = str(e)
+            if "404" not in msg and "not found" not in msg.lower() and "no longer available" not in msg.lower():
+                raise
+            # Google often names the replacement model in the error, so try that next
+            suggested = re.findall(r"models/(gemini-[\w.\-]+)", msg)
+            candidates = [x for x in suggested if x not in tried] + candidates
+            if not candidates:
+                found = pick_flash_model(client)
+                if found and found not in tried:
+                    candidates.append(found)
+    else:
+        raise RuntimeError("No available Gemini model was found. Check your API key in Google AI Studio.")
     return json.loads(resp.text)
+
+
+def friendly_error(e) -> str:
+    msg = str(e)
+    low = msg.lower()
+    if "api key" in low or "permission" in low or "401" in msg or "403" in msg:
+        return "The Gemini API key wasn't accepted. Create a new key in Google AI Studio and update it in the app's secrets."
+    if "429" in msg or "quota" in low or "rate" in low:
+        return "The free Gemini limit was reached. Wait a minute and try again."
+    if "404" in msg or "not found" in low:
+        return "The AI model isn't available. Open the sidebar and enter a current model name from Google AI Studio."
+    return f"Something went wrong talking to Gemini. Try again in a moment. ({msg[:200]})"
 
 
 def build_report(df, choice_cols, rating_cols, ai_results) -> str:
@@ -205,7 +341,7 @@ def build_report(df, choice_cols, rating_cols, ai_results) -> str:
         pct = df[col].value_counts(normalize=True).mul(100).round(0)
         lines += [f"- {k}: {int(v)}%" for k, v in pct.items()] + [""]
     for col in rating_cols:
-        lines += [f"## {col}", f"- Average: {df[col].mean():.1f}", ""]
+        lines += [f"## {col}", f"- Average: {pd.to_numeric(df[col], errors="coerce").mean():.1f}", ""]
     for col, res in ai_results.items():
         lines += [f"## {col}", "", res.get("summary", ""), "", "### Themes"]
         for t in res.get("themes", []):
@@ -252,7 +388,7 @@ with st.sidebar:
                                 help="Free from aistudio.google.com. It is only used for this session.")
     else:
         st.success("AI is ready to use")
-    model = st.text_input("Model", value=DEFAULT_MODEL)
+    model = st.text_input("Model", value=st.session_state.get("working_model", DEFAULT_MODEL))
     runs_left = MAX_RUNS_PER_SESSION - st.session_state.get("runs", 0)
     st.caption(f"AI analyses left this visit: {max(runs_left, 0)} of {MAX_RUNS_PER_SESSION}")
     st.caption("Your data is sent to Google Gemini only when you click Analyse.")
@@ -263,7 +399,7 @@ st.markdown("""
   <h1>Survey Insight Assistant</h1>
   <p>Turn hundreds of survey answers into clear themes, real quotes and recommendations in under a minute.</p>
   <div class="si-steps">
-    <div class="si-step"><i>1</i><b>Upload your survey</b><span>Any CSV, like a Google Forms export</span></div>
+    <div class="si-step"><i>1</i><b>Upload your survey</b><span>A CSV or Excel file, like a Google Forms export</span></div>
     <div class="si-step"><i>2</i><b>See the numbers</b><span>Instant charts for every multiple-choice question</span></div>
     <div class="si-step"><i>3</i><b>Get AI insights</b><span>Themes, quotes and recommendations from written answers</span></div>
   </div>
@@ -271,7 +407,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 with st.container(border=True):
-    uploaded = st.file_uploader("Upload a CSV file", type="csv", label_visibility="collapsed")
+    uploaded = st.file_uploader("Upload a survey file", type=["csv", "xlsx"], label_visibility="collapsed")
 
 if uploaded is not None and st.session_state.get("file_name") != uploaded.name:
     st.session_state["file_name"] = uploaded.name
@@ -279,25 +415,55 @@ if uploaded is not None and st.session_state.get("file_name") != uploaded.name:
 
 if uploaded is None:
     st.markdown('<div class="si-empty"><b>Upload a survey to get started</b>'
-                'Export your responses as a CSV file, for example from Google Forms or Microsoft Forms.</div>',
+                'Upload a CSV or Excel file, for example an export from Google Forms or Microsoft Forms.</div>',
                 unsafe_allow_html=True)
     st.stop()
 
 try:
-    df = pd.read_csv(uploaded)
+    df = read_survey(uploaded)
 except Exception:
-    st.error("This file couldn't be read as a CSV. Export your survey as CSV and upload it again.")
+    st.error("This file couldn't be opened. Save it as a CSV or Excel (.xlsx) file and upload it again.")
+    st.stop()
+df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
+df.columns = [str(c).strip() for c in df.columns]
+if df.empty:
+    st.error("This file has no responses in it.")
     st.stop()
 source = esc(uploaded.name)
 
-choice_cols, rating_cols, text_cols = classify_columns(df)
+# Guess each column's type once per file, then let the user correct it
+if st.session_state.get("types_for") != uploaded.name:
+    st.session_state["types_for"] = uploaded.name
+    st.session_state["types"] = {c: guess_type(c, df) for c in df.columns}
+types = st.session_state["types"]
+choice_cols, rating_cols, text_cols = split_types(types)
+skipped = [c for c, t in types.items() if t == TYPE_SKIP]
 
 st.markdown(f'<div class="si-h">Overview</div><p class="si-sub">{source}</p>', unsafe_allow_html=True)
 st.markdown(f"""<div class="si-metrics">
 <div class="si-metric"><div class="n">{len(df)}</div><div class="l">Responses</div></div>
-<div class="si-metric"><div class="n">{len(df.columns)}</div><div class="l">Questions</div></div>
+<div class="si-metric"><div class="n">{len(choice_cols) + len(rating_cols) + len(text_cols)}</div><div class="l">Questions analysed</div></div>
 <div class="si-metric"><div class="n">{len(text_cols)}</div><div class="l">Open-ended questions for AI</div></div>
 </div>""", unsafe_allow_html=True)
+if skipped:
+    st.caption("Skipped (not survey questions): " + ", ".join(skipped))
+
+with st.expander("Check question types"):
+    st.write("The app guessed what kind of question each column is. Change any that look wrong.")
+    table = pd.DataFrame({"Question": list(types.keys()), "Type": list(types.values())})
+    edited = st.data_editor(
+        table, hide_index=True, width="stretch", key=f"types_editor_{uploaded.name}",
+        disabled=["Question"],
+        column_config={"Type": st.column_config.SelectboxColumn("Type", options=TYPES, required=True)})
+    new_types = dict(zip(edited["Question"], edited["Type"]))
+    for c, t in new_types.items():
+        if t == TYPE_RATING and not pd.api.types.is_numeric_dtype(pd.to_numeric(df[c], errors="coerce").dropna()):
+            new_types[c] = types[c]
+    if new_types != types:
+        st.session_state["types"] = new_types
+        st.session_state.pop("ai_results", None)
+        st.rerun()
+
 with st.expander("Preview the data"):
     st.dataframe(df, width="stretch", hide_index=True)
 
@@ -310,7 +476,7 @@ if choice_cols or rating_cols:
             with st.container(border=True):
                 st.markdown(f"**{esc(col)}**")
                 if col in rating_cols:
-                    st.caption(f"Average score: {df[col].mean():.1f}")
+                    st.caption(f"Average score: {pd.to_numeric(df[col], errors="coerce").mean():.1f}")
                 st.altair_chart(bar_chart(df, col, col in rating_cols), width="stretch")
 
 st.markdown('<div class="si-h">AI insights</div><p class="si-sub">Let AI read the written answers and find the '
@@ -341,7 +507,7 @@ if go:
             try:
                 results[col] = (analyse_text(answers, col, api_key, model), len(answers))
             except Exception as e:
-                st.error(f"Couldn't analyse \"{col}\". Check the API key and model name, then try again. ({e})")
+                st.error(f"Couldn't analyse \"{col}\". {friendly_error(e)}")
     st.session_state["ai_results"] = results
 
 results = st.session_state.get("ai_results", {})
